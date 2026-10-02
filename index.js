@@ -1,6 +1,6 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -19,7 +19,26 @@ let globalArgoDomain = '';
 let globalArgoVless = '';
 let argoLogBuffer = [];
 
-// 1. 生成 Sing-box 配置文件
+// 1. 自动为二进制文件赋予 Linux 执行权限 (chmod +x)
+function grantPermissions() {
+  ['sing-box', 'cloudflared'].forEach(file => {
+    const filePath = path.join(__dirname, file);
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.chmodSync(filePath, '755');
+        console.log(`[权限] 已成功设置 ${file} 为可执行`);
+      } catch (e) {
+        try { execSync(`chmod +x ${filePath}`); } catch (err) {}
+      }
+    } else {
+      argoLogBuffer.push(`[错误] 根目录下未找到 ${file} 文件！`);
+      console.error(`[错误] 未找到文件: ${filePath}`);
+    }
+  });
+}
+grantPermissions();
+
+// 2. 生成 Sing-box 配置文件
 const singboxConfig = {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [{
@@ -44,7 +63,7 @@ try {
   console.error('[系统] 写入配置文件失败:', err);
 }
 
-// 2. 网页面板
+// 3. 网页面板
 app.get('/', (req, res) => {
   const hostHeader = DOMAIN || req.headers.host || 'olive-echo-1048.de.deplexo.com';
   const directLink = `vless://${UUID}@${hostHeader}:443?type=ws&security=tls&path=${encodeURIComponent(WSPATH)}&host=${hostHeader}&sni=${hostHeader}#Deplexo-Direct-VLESS`;
@@ -67,7 +86,7 @@ app.get('/', (req, res) => {
       .btn:hover { background: #1d4ed8; }
       .status { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; background: #dcfce7; color: #15803d; }
       .status.waiting { background: #fef3c7; color: #b45309; }
-      .log-box { background: #1e1e1e; color: #00ff66; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 11px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; margin-top: 8px; }
+      .log-box { background: #1e1e1e; color: #00ff66; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 11px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; margin-top: 8px; }
     </style>
   </head>
   <body>
@@ -92,10 +111,10 @@ app.get('/', (req, res) => {
       <button class="btn" onclick="copyText('argo-link')">复制 Argo 节点</button>
     `;
   } else {
-    const recentLogs = argoLogBuffer.slice(-6).join('\n') || '等待 Cloudflared 启动...';
+    const recentLogs = argoLogBuffer.slice(-8).join('\n') || '等待 Cloudflared 进程响应...';
     html += `
       <p><span class="status waiting">⌛ Argo 隧道连接中，请稍后刷新页面...</span></p>
-      <div style="font-size:12px;color:#666;">实时日志提示：</div>
+      <div style="font-size:12px;color:#666;">后台启动日志：</div>
       <div class="log-box">${recentLogs}</div>
       <button class="btn" style="margin-top:10px;background:#4b5563;" onclick="location.reload()">刷新页面</button>
     `;
@@ -116,22 +135,20 @@ app.get('/', (req, res) => {
   res.send(html);
 });
 
-// 3. 订阅接口
+// 4. 订阅地址
 app.get('/sub', (req, res) => {
   const hostHeader = DOMAIN || req.headers.host || 'olive-echo-1048.de.deplexo.com';
   const directLink = `vless://${UUID}@${hostHeader}:443?type=ws&security=tls&path=${encodeURIComponent(WSPATH)}&host=${hostHeader}&sni=${hostHeader}#Deplexo-Direct-VLESS`;
   
   let list = [directLink];
-  if (globalArgoVless) {
-    list.push(globalArgoVless);
-  }
+  if (globalArgoVless) list.push(globalArgoVless);
   
   const base64Sub = Buffer.from(list.join('\n')).toString('base64');
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.send(base64Sub);
 });
 
-// 4. WebSocket 转发
+// 5. WebSocket 转发
 app.use(
   WSPATH,
   createProxyMiddleware({
@@ -149,34 +166,48 @@ app.listen(PORT, () => {
 
 function startSubServices() {
   // 启动 Sing-box
-  const sb = spawn('./sing-box', ['run', '-c', CONFIG_PATH]);
-  sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
-  sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
+  try {
+    const sb = spawn('./sing-box', ['run', '-c', CONFIG_PATH], { cwd: __dirname });
+    sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
+    sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
+    sb.on('error', (err) => console.error('[sing-box 启动错误]:', err));
+  } catch (err) {
+    console.error('[sing-box 执行错误]:', err);
+  }
 
-  // 启动 Cloudflare Argo 隧道（强制 --protocol http2 避开 UDP 封锁）
-  const argo = spawn('./cloudflared', [
-    'tunnel',
-    '--no-autoupdate',
-    '--protocol', 'http2',
-    '--url', `http://127.0.0.1:${INTERNAL_PORT}`
-  ]);
+  // 启动 Cloudflare Argo
+  try {
+    const argo = spawn('./cloudflared', [
+      'tunnel',
+      '--no-autoupdate',
+      '--protocol', 'http2',
+      '--url', `http://127.0.0.1:${INTERNAL_PORT}`
+    ], { cwd: __dirname });
 
-  const parseArgo = (data) => {
-    const str = data.toString();
-    argoLogBuffer.push(str.trim());
-    if (argoLogBuffer.length > 20) argoLogBuffer.shift();
+    const parseArgo = (data) => {
+      const str = data.toString().trim();
+      argoLogBuffer.push(str);
+      if (argoLogBuffer.length > 30) argoLogBuffer.shift();
 
-    const match = str.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
-    if (match && match[1] && !globalArgoDomain) {
-      globalArgoDomain = match[1];
-      const encodedPath = encodeURIComponent(WSPATH);
-      globalArgoVless = `vless://${UUID}@${globalArgoDomain}:443?type=ws&security=tls&path=${encodedPath}&host=${globalArgoDomain}&sni=${globalArgoDomain}#Deplexo-Argo-VLESS`;
-      console.log(`[Argo] 隧道生成成功: ${globalArgoDomain}`);
-    }
-  };
+      const match = str.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
+      if (match && match[1] && !globalArgoDomain) {
+        globalArgoDomain = match[1];
+        const encodedPath = encodeURIComponent(WSPATH);
+        globalArgoVless = `vless://${UUID}@${globalArgoDomain}:443?type=ws&security=tls&path=${encodedPath}&host=${globalArgoDomain}&sni=${globalArgoDomain}#Deplexo-Argo-VLESS`;
+        console.log(`[Argo] 隧道生成成功: ${globalArgoDomain}`);
+      }
+    };
 
-  argo.stdout.on('data', parseArgo);
-  argo.stderr.on('data', parseArgo);
+    argo.stdout.on('data', parseArgo);
+    argo.stderr.on('data', parseArgo);
+    argo.on('error', (err) => {
+      const msg = `[cloudflared 启动失败] ${err.message} (请检查仓库根目录下是否存在 cloudflared Linux 64位可执行文件)`;
+      console.error(msg);
+      argoLogBuffer.push(msg);
+    });
+  } catch (err) {
+    argoLogBuffer.push(`[cloudflared 执行异常] ${err.message}`);
+  }
 }
 
 process.on('uncaughtException', (err) => console.error('[Uncaught Exception]', err));
