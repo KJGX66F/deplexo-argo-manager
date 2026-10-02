@@ -1,7 +1,13 @@
 {
-  "name": "singbox-argo",
+  "name": "argo-tuic-easyshare",
   "version": "1.0.0",
+  "description": "Lightweight Argo Tunnel and TUIC deployment script for Pterodactyl",
+  "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-  }
+    "start": "bash start.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {}
 }
