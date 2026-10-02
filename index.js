@@ -15,7 +15,19 @@ const PORT = process.env.PORT || 3000;
 const UUID = process.env.UUID || crypto.randomUUID();
 const cleanUUID = UUID.replace(/-/g, '').toLowerCase();
 const SUB_PATH = process.env.SUB_PATH || 'sub';
-const CFIP = process.env.CFIP || 'www.visa.com.tw';
+
+// 预设多个优质 CF 优选域名/IP（可随意增减或通过环境变量控制）
+// 预设多个高质量社区动态优选域名与企业级 CF 域名
+const DEFAULT_CF_NODES = [
+  { name: 'CF-动态优选1', domain: 'cf.090227.xyz' },
+  { name: 'CF-动态优选2', domain: 'ip.164746.xyz' },
+  { name: 'CF-动态优选3', domain: 'bestcf.onecf.eu.org' },
+  { name: 'CF-动态优选4', domain: 'cf.886.best' },
+  { name: 'CF-工行节点', domain: 'icbc.com.cn' },
+  { name: 'CF-Visa台湾', domain: 'www.visa.com.tw' },
+  { name: 'CF-Shopify', domain: 'shopify.com' },
+  { name: 'CF-TimeIs', domain: 'time.is' }
+];
 
 let argoDomain = '';
 
@@ -24,25 +36,29 @@ const wss = new WebSocket.Server({ server, path: '/vless' });
 
 // 根目录响应
 app.get('/', (req, res) => {
-  res.send('Abasthan VLESS Node is Running!');
+  res.send('Abasthan VLESS Multi-Node Server is Running!');
 });
 
-// 节点订阅路由
+// 节点订阅路由：动态生成多个 CF 节点
 app.get(`/${SUB_PATH}`, (req, res) => {
   const host = req.headers.host;
-
-  // 1. 直连节点 (首选)
-  const vlessDirect = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#Abasthan-Direct`;
-  
-  // 2. Cloudflare 临时隧道 + 优选 IP 节点
   const targetHost = argoDomain || host;
-  const vlessCF = `vless://${UUID}@${CFIP}:443?encryption=none&security=tls&type=ws&host=${targetHost}&path=%2Fvless#Abasthan-ArgoCF`;
+  const nodeList = [];
+
+  // 1. 直连节点 (不经过 CF 中转)
+  nodeList.push(`vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#Abasthan-Direct`);
+
+  // 2. 遍历多域名生成多个 CF 加速节点
+  DEFAULT_CF_NODES.forEach((item) => {
+    const remark = encodeURIComponent(`Abasthan-${item.name}`);
+    nodeList.push(`vless://${UUID}@${item.domain}:443?encryption=none&security=tls&type=ws&host=${targetHost}&path=%2Fvless#${remark}`);
+  });
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.send(`${vlessDirect}\n${vlessCF}`);
+  res.send(nodeList.join('\n'));
 });
 
-// VLESS 代理服务实现
+// VLESS 代理逻辑处理
 wss.on('connection', (ws) => {
   let isHeaderParsed = false;
   let targetSocket = null;
@@ -60,7 +76,6 @@ wss.on('connection', (ws) => {
     const version = chunk[0];
     const clientUuidHex = chunk.slice(1, 17).toString('hex').toLowerCase();
 
-    // 验证 UUID 身份
     if (clientUuidHex !== cleanUUID) {
       ws.close();
       return;
@@ -95,10 +110,8 @@ wss.on('connection', (ws) => {
     const payload = chunk.slice(offset);
     isHeaderParsed = true;
 
-    // 返回 VLESS 响应头
     ws.send(Buffer.from([version, 0]));
 
-    // 建立 TCP 连接
     targetSocket = net.connect({ host: address, port: port }, () => {
       if (payload.length > 0) {
         targetSocket.write(payload);
@@ -124,7 +137,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// 自动下载并启动 Cloudflare Argo 临时隧道（修复 ETXTBSY 问题）
+// 自动下载并启动 Argo 隧道
 function startCloudflared(port) {
   const binaryPath = path.join(__dirname, 'cloudflared');
   const downloadUrl = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
@@ -133,7 +146,7 @@ function startCloudflared(port) {
     try {
       fs.chmodSync(binaryPath, '755');
     } catch (e) {
-      console.error('赋予运行权限失败:', e.message);
+      console.error('赋予权限失败:', e.message);
     }
 
     const child = spawn(binaryPath, ['tunnel', '--no-autoupdate', '--url', `http://localhost:${port}`]);
@@ -143,12 +156,12 @@ function startCloudflared(port) {
       const match = log.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
       if (match) {
         argoDomain = match[0].replace('https://', '');
-        console.log(`[Argo Tunnel] Cloudflare 临时隧道启动成功: ${argoDomain}`);
+        console.log(`[Argo Tunnel] 隧道建立成功: ${argoDomain}`);
       }
     });
 
     child.on('error', (err) => {
-      console.error('[Argo Tunnel] 进程启动失败:', err.message);
+      console.error('[Argo Tunnel] 启动失败:', err.message);
     });
   };
 
@@ -160,7 +173,6 @@ function startCloudflared(port) {
         const file = fs.createWriteStream(binaryPath);
         response.pipe(file);
         file.on('finish', () => {
-          // 异步等待文件流安全关闭，释放文件占用的句柄
           file.close(() => {
             setTimeout(() => {
               runCloudflared();
@@ -178,12 +190,15 @@ function startCloudflared(port) {
   }
 }
 
-// 启动端口监听
+// 启动服务与防休眠保活
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
-  console.log(`[VLESS] 服务已成功启动！`);
-  console.log(`[VLESS] 端口: ${PORT}`);
-  console.log(`[VLESS] 本次随机 UUID: ${UUID}`);
+  console.log(`[VLESS] 服务已启动，访问 /${SUB_PATH} 获取多节点订阅`);
   console.log(`========================================`);
   startCloudflared(PORT);
+
+  // 每 4 分钟请求一次自身，防止容器休眠
+  setInterval(() => {
+    https.get(`https://address-probable-gorilla.abasthan.app/`, () => {}).on('error', () => {});
+  }, 4 * 60 * 1000);
 });
