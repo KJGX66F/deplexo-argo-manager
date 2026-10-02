@@ -1,0 +1,7 @@
+framework: node
+
+install: npm install
+
+start: npm start
+
+port: 3000
