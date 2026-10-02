@@ -3,16 +3,20 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000');
-const INTERNAL_PORT = 8080; // Sing-box 监听的内部端口
+const INTERNAL_PORT = 8080; 
 const UUID = process.env.UUID || crypto.randomUUID();
 const WSPATH = process.env.WSPATH || '/vless-ws';
 const DOMAIN = process.env.DOMAIN || '';
 
-// 1. 生成 Sing-box 配置文件（监听内部端口 INTERNAL_PORT）
+// 将配置文件写入 /tmp 临时目录，避开 /app 只读限制
+const CONFIG_PATH = path.join(os.tmpdir(), 'config.json');
+
+// 1. 生成 Sing-box 配置文件
 const singboxConfig = {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [{
@@ -31,14 +35,19 @@ const singboxConfig = {
   "outbounds": [{ "type": "direct", "tag": "direct" }]
 };
 
-fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(singboxConfig, null, 2));
+try {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(singboxConfig, null, 2));
+  console.log(`[系统] 配置文件已生成至: ${CONFIG_PATH}`);
+} catch (err) {
+  console.error('[系统] 写入配置文件失败:', err);
+}
 
-// 2. HTTP 根路由：响应 Deplexo 平台的健康检查
+// 2. HTTP 根路由：响应平台健康检查
 app.get('/', (req, res) => {
-  res.status(200).send('Deplexo VLESS & Argo Service is Running!');
+  res.status(200).send('Deplexo VLESS Service is Running!');
 });
 
-// 3. 将平台的 WebSocket 请求转发给 Sing-box 内部端口
+// 3. WebSocket 流量转发
 app.use(
   WSPATH,
   createProxyMiddleware({
@@ -49,10 +58,10 @@ app.use(
   })
 );
 
-// 4. 启动 Express 监听 PORT
+// 4. 启动 HTTP 服务
 app.listen(PORT, () => {
   console.log('==================================================');
-  console.log(`[Express] 服务启动成功，监听端口: ${PORT}`);
+  console.log(`[Express] 服务已启动，监听端口: ${PORT}`);
   console.log(`[系统] 节点 UUID: ${UUID}`);
   console.log(`[系统] WebSocket Path: ${WSPATH}`);
   console.log('==================================================');
@@ -61,12 +70,12 @@ app.listen(PORT, () => {
 });
 
 function startSubServices() {
-  // 启动 Sing-box 核心
-  const sb = spawn('./sing-box', ['run', '-c', 'config.json']);
+  // 启动 Sing-box，指定 /tmp/config.json
+  const sb = spawn('./sing-box', ['run', '-c', CONFIG_PATH]);
   sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
   sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
 
-  // 启动 Cloudflare Argo 隧道（穿透内部端口 INTERNAL_PORT）
+  // 启动 Cloudflare Argo 临时隧道
   const argo = spawn('./cloudflared', ['tunnel', '--url', `http://127.0.0.1:${INTERNAL_PORT}`]);
   let argoDomain = '';
 
