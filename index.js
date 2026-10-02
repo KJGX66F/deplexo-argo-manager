@@ -11,9 +11,11 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 环境变量或自动随机生成 UUID
+// 【核心逻辑】优先读取环境变量 process.env.UUID；未设置则每次启动随机生成 UUID
 const UUID = process.env.UUID || crypto.randomUUID();
 const cleanUUID = UUID.replace(/-/g, '').toLowerCase();
+
+// 订阅路径优先读取 process.env.SUB_PATH；未设置则与当前 UUID 一致
 const SUB_PATH = process.env.SUB_PATH || UUID;
 
 // 预设高质量社区动态优选域名与企业级 CF 域名
@@ -34,32 +36,32 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/vless' });
 
 app.get('/', (req, res) => {
-  res.send(`Abasthan VLESS Node Running! Argo Status: ${argoDomain || 'Connecting...'}`);
+  res.send(`Abasthan VLESS Server is Running! Argo: ${argoDomain || 'Connecting...'}`);
 });
 
-// 节点订阅路由：使用 UUID 作为访问路径
+// 节点订阅路由
 app.get(`/${SUB_PATH}`, (req, res) => {
   const host = req.headers.host;
   const nodeList = [];
 
-  // 1. 直连节点
+  // 直连节点
   nodeList.push(`vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#Abasthan-Direct`);
 
-  // 2. 只有当 Argo 隧道成功获取到域名后，才生成 CF 节点，防止生成无效节点
+  // CF 优选节点
   if (argoDomain) {
     DEFAULT_CF_NODES.forEach((item) => {
       const remark = encodeURIComponent(`Abasthan-${item.name}`);
       nodeList.push(`vless://${UUID}@${item.domain}:443?encryption=none&security=tls&type=ws&host=${argoDomain}&path=%2Fvless#${remark}`);
     });
   } else {
-    nodeList.push(`vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#Argo隧道建立中_请等待10秒后重新刷新订阅`);
+    nodeList.push(`vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#Argo隧道建立中_10秒后刷新订阅`);
   }
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.send(nodeList.join('\n'));
 });
 
-// VLESS 代理服务核心实现
+// VLESS 代理实现
 wss.on('connection', (ws) => {
   let isHeaderParsed = false;
   let targetSocket = null;
@@ -75,6 +77,7 @@ wss.on('connection', (ws) => {
     const version = chunk[0];
     const clientUuidHex = chunk.slice(1, 17).toString('hex').toLowerCase();
 
+    // 校验 UUID 鉴权
     if (clientUuidHex !== cleanUUID) {
       ws.close();
       return;
@@ -125,17 +128,15 @@ wss.on('connection', (ws) => {
   ws.on('error', () => { if (targetSocket) targetSocket.destroy(); });
 });
 
-// 递归处理多重 302 重定向下载 cloudflared 二进制
+// 使用镜像源加速下载并启动 Argo 隧道
 function startCloudflared(port) {
   const binaryPath = path.join(__dirname, 'cloudflared');
-  const downloadUrl = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
+  const downloadUrl = 'https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
 
   const runCloudflared = () => {
     try {
       fs.chmodSync(binaryPath, '755');
-    } catch (e) {
-      console.error('权限分配错误:', e.message);
-    }
+    } catch (e) {}
 
     const child = spawn(binaryPath, ['tunnel', '--no-autoupdate', '--url', `http://localhost:${port}`]);
 
@@ -150,14 +151,11 @@ function startCloudflared(port) {
       }
     });
 
-    child.on('error', (err) => console.error('[Argo Tunnel] 进程启动失败:', err.message));
+    child.on('error', (err) => console.error('[Argo] 启动失败:', err.message));
   };
 
   const downloadFile = (url, redirects = 0) => {
-    if (redirects > 5) {
-      console.error('下载重定向次数过多，停止下载');
-      return;
-    }
+    if (redirects > 5) return;
     https.get(url, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         downloadFile(res.headers.location, redirects + 1);
@@ -165,28 +163,27 @@ function startCloudflared(port) {
         const file = fs.createWriteStream(binaryPath);
         res.pipe(file);
         file.on('finish', () => {
-          file.close(() => setTimeout(runCloudflared, 1500));
+          file.close(() => setTimeout(runCloudflared, 1000));
         });
       } else {
-        console.error(`下载失败，HTTP状态码: ${res.statusCode}`);
+        console.error(`[Argo] 下载失败，HTTP状态码: ${res.statusCode}`);
       }
-    }).on('error', (err) => console.error('Cloudflared 下载出错:', err.message));
+    }).on('error', (err) => console.error('[Argo] 下载错误:', err.message));
   };
 
-  // 校验文件是否存在且完整（必须大于 10MB）
   if (!fs.existsSync(binaryPath) || fs.statSync(binaryPath).size < 10000000) {
-    console.log('[Argo] 开始自动下载 cloudflared 执行文件...');
+    console.log('[Argo] 正在通过镜像加速源下载 cloudflared...');
     downloadFile(downloadUrl);
   } else {
     runCloudflared();
   }
 }
 
-// 启动端口监听与动态防休眠保活
+// 启动服务
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
-  console.log(`[VLESS] 服务已成功启动！`);
-  console.log(`[VLESS] UUID: ${UUID}`);
+  console.log(`[VLESS] 服务已启动！`);
+  console.log(`[VLESS] 当前使用的 UUID: ${UUID}`);
   console.log(`[VLESS] 订阅地址路径: /${SUB_PATH}`);
   console.log(`========================================`);
   startCloudflared(PORT);
