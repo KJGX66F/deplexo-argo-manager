@@ -3,10 +3,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
-const https = require('https');
-const http = require('http');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000');
@@ -15,102 +12,16 @@ const UUID = process.env.UUID || crypto.randomUUID();
 const WSPATH = process.env.WSPATH || '/vless-ws';
 const DOMAIN = process.env.DOMAIN || '';
 
-// 自动判断系统的 CPU 架构 (amd64 / arm64)
-function getArch() {
-  const arch = process.arch;
-  if (arch === 'arm64') return 'arm64';
-  if (arch === 'x64') return 'amd64';
-  return 'amd64';
-}
-
-const ARCH = getArch();
-
-// 优先使用本地 .bin 目录，若不可写则退回 /tmp 目录
-let BIN_DIR = path.join(__dirname, '.bin');
-try {
-  if (!fs.existsSync(BIN_DIR)) fs.mkdirSync(BIN_DIR, { recursive: true });
-} catch (e) {
-  BIN_DIR = os.tmpdir();
-}
-
-const CONFIG_PATH = path.join(BIN_DIR, 'config.json');
-const SB_PATH = path.join(BIN_DIR, 'sing-box');
-const CF_PATH = path.join(BIN_DIR, 'cloudflared');
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+const SB_PATH = path.join(__dirname, 'sing-box');
+const CF_PATH = path.join(__dirname, 'cloudflared');
 
 let globalArgoDomain = '';
 let globalArgoVless = '';
 let argoLogBuffer = [];
 
-// 原生 Node.js 下载函数（自动跟随 HTTP 重定向）
-function downloadFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    const get = (currentUrl) => {
-      const client = currentUrl.startsWith('https') ? https : http;
-      client.get(currentUrl, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return get(res.headers.location);
-        }
-        if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP 状态码: ${res.statusCode}`));
-        }
-        res.pipe(file);
-        file.on('finish', () => file.close(resolve));
-      }).on('error', (err) => {
-        fs.unlink(destPath, () => {});
-        reject(err);
-      });
-    };
-    get(url);
-  });
-}
-
-// 强制设置文件可执行权限
-function setExecutable(filePath) {
-  try { fs.chmodSync(filePath, 0o755); } catch (e) {}
-  try { execSync(`chmod +x "${filePath}"`); } catch (e) {}
-}
-
-// 下载与准备依赖
-async function prepareBinaries() {
-  argoLogBuffer.push(`[系统] 识别环境架构: Linux ${ARCH}`);
-
-  // 1. 下载 cloudflared
-  if (!fs.existsSync(CF_PATH)) {
-    argoLogBuffer.push('[系统] 开始下载 cloudflared...');
-    try {
-      const cfUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}`;
-      await downloadFile(cfUrl, CF_PATH);
-      setExecutable(CF_PATH);
-      argoLogBuffer.push('[系统] cloudflared 下载并成功赋予执行权限！');
-    } catch (e) {
-      argoLogBuffer.push(`[错误] cloudflared 下载失败: ${e.message}`);
-    }
-  } else {
-    setExecutable(CF_PATH);
-  }
-
-  // 2. 下载 sing-box
-  if (!fs.existsSync(SB_PATH)) {
-    argoLogBuffer.push('[系统] 开始下载 sing-box...');
-    const tarPath = path.join(BIN_DIR, 'sing-box.tar.gz');
-    try {
-      const sbUrl = `https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${ARCH}.tar.gz`;
-      await downloadFile(sbUrl, tarPath);
-      
-      // 正确的 tar 解压指令（去除引起报错的通配符）
-      execSync(`tar -zxvf "${tarPath}" -C "${BIN_DIR}" --strip-components=1`);
-      if (fs.existsSync(tarPath)) fs.unlinkSync(tarPath);
-      
-      setExecutable(SB_PATH);
-      argoLogBuffer.push('[系统] sing-box 解压并成功赋予执行权限！');
-    } catch (e) {
-      argoLogBuffer.push(`[错误] sing-box 解压/启动准备失败: ${e.message}`);
-    }
-  } else {
-    setExecutable(SB_PATH);
-  }
-}
+// 再次确认启动权限
+try { execSync(`chmod +x "${SB_PATH}" "${CF_PATH}"`); } catch (e) {}
 
 // 生成 Sing-box 配置文件
 const singboxConfig = {
@@ -187,7 +98,7 @@ app.get('/', (req, res) => {
   } else {
     const recentLogs = argoLogBuffer.slice(-10).join('\n') || '正在初始化并建立 Argo 隧道...';
     html += `
-      <p><span class="status waiting">⌛ 正在准备依赖/生成隧道，请几秒后刷新...</span></p>
+      <p><span class="status waiting">⌛ 正在连接 Argo 隧道，请几秒后刷新...</span></p>
       <div style="font-size:12px;color:#666;">后台日志输出：</div>
       <div class="log-box">${recentLogs}</div>
       <button class="btn" style="margin-top:10px;background:#4b5563;" onclick="location.reload()">刷新页面</button>
@@ -233,14 +144,9 @@ app.use(
   })
 );
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`[Express] 服务启动成功，监听端口: ${PORT}`);
-  try {
-    await prepareBinaries();
-    startSubServices();
-  } catch (err) {
-    argoLogBuffer.push(`[初始化错误] ${err.message}`);
-  }
+  startSubServices();
 });
 
 function startSubServices() {
@@ -254,7 +160,7 @@ function startSubServices() {
     argoLogBuffer.push(`[sing-box 启动异常] ${err.message}`);
   }
 
-  // 启动 Cloudflare Argo (强制 http2)
+  // 启动 Cloudflare Argo (强制 http2 规避 UDP 限制)
   try {
     const argo = spawn(CF_PATH, [
       'tunnel',
