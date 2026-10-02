@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
 const http = require('http');
+const os = require('os');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000');
@@ -14,8 +15,14 @@ const UUID = process.env.UUID || crypto.randomUUID();
 const WSPATH = process.env.WSPATH || '/vless-ws';
 const DOMAIN = process.env.DOMAIN || '';
 
-// 工作目录定义在当前项目根目录
-const WORK_DIR = __dirname;
+// 使用可读写的系统临时目录 /tmp，解决 EROFS 只读文件系统报错
+const WORK_DIR = path.join(os.tmpdir(), 'vless-run');
+if (!fs.existsSync(WORK_DIR)) {
+  try {
+    fs.mkdirSync(WORK_DIR, { recursive: true });
+  } catch (e) {}
+}
+
 const CONFIG_PATH = path.join(WORK_DIR, 'config.json');
 const SB_PATH = path.join(WORK_DIR, 'sing-box');
 const CF_PATH = path.join(WORK_DIR, 'cloudflared');
@@ -31,21 +38,21 @@ function getArch() {
   return 'amd64';
 }
 
-// 强力三重保障下载函数 (curl -> wget -> Node https)
+// 三重下载保障逻辑
 async function downloadFile(url, destPath) {
-  // 方式 1: 优先使用系统的 curl (处理重定向和 GitHub 鉴权极佳)
+  // 方式 1: curl
   try {
     execSync(`curl -fsSL -L "${url}" -o "${destPath}"`, { stdio: 'ignore', timeout: 60000 });
     if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) return;
   } catch (e) {}
 
-  // 方式 2: 备用 wget
+  // 方式 2: wget
   try {
     execSync(`wget -q -O "${destPath}" "${url}"`, { stdio: 'ignore', timeout: 60000 });
     if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) return;
   } catch (e) {}
 
-  // 方式 3: Node.js 原生 https 请求 (带 User-Agent 与自动跟随重定向)
+  // 方式 3: Node.js https 请求
   return new Promise((resolve, reject) => {
     const fetchUrl = (currentUrl, redirectCount = 0) => {
       if (redirectCount > 10) return reject(new Error('重定向次数过多'));
@@ -80,20 +87,20 @@ async function downloadFile(url, destPath) {
   });
 }
 
-// 赋予可执行权限
+// 赋予执行权限
 function setExecutable(filePath) {
   try { fs.chmodSync(filePath, 0o755); } catch (e) {}
   try { execSync(`chmod +x "${filePath}"`); } catch (e) {}
 }
 
-// 下载与准备依赖文件
+// 下载与准备程序
 async function prepareBinaries() {
   const arch = getArch();
   argoLogBuffer.push(`[系统] 识别环境架构: Linux ${arch}`);
 
   // 1. 下载 cloudflared
   if (!fs.existsSync(CF_PATH)) {
-    argoLogBuffer.push('[系统] 正在下载 cloudflared...');
+    argoLogBuffer.push('[系统] 正在下载 cloudflared 到 /tmp...');
     try {
       const cfUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}`;
       await downloadFile(cfUrl, CF_PATH);
@@ -112,7 +119,7 @@ async function prepareBinaries() {
 
   // 2. 下载 sing-box
   if (!fs.existsSync(SB_PATH)) {
-    argoLogBuffer.push('[系统] 正在下载 sing-box...');
+    argoLogBuffer.push('[系统] 正在下载 sing-box 到 /tmp...');
     const tarPath = path.join(WORK_DIR, 'sing-box.tar.gz');
     try {
       const sbUrl = `https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${arch}.tar.gz`;
@@ -125,7 +132,7 @@ async function prepareBinaries() {
       }
       if (fs.existsSync(tarPath)) fs.unlinkSync(tarPath);
 
-      // 如果解压到了子目录，自动寻找并移动到根目录
+      // 如果解压到了子目录，自动寻找并移动到 WORK_DIR
       if (!fs.existsSync(SB_PATH)) {
         const files = fs.readdirSync(WORK_DIR);
         for (const file of files) {
@@ -286,7 +293,7 @@ app.listen(PORT, async () => {
 });
 
 function startSubServices() {
-  // 校验并启动 Sing-box
+  // 启动 Sing-box
   if (!fs.existsSync(SB_PATH)) {
     argoLogBuffer.push(`[错误] 无法启动 sing-box: 文件不存在`);
   } else {
@@ -300,7 +307,7 @@ function startSubServices() {
     }
   }
 
-  // 校验并启动 Cloudflare Argo
+  // 启动 Cloudflare Argo
   if (!fs.existsSync(CF_PATH)) {
     argoLogBuffer.push(`[错误] 无法启动 cloudflared: 文件不存在`);
   } else {
