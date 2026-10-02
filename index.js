@@ -1,21 +1,25 @@
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+const app = express();
 const PORT = parseInt(process.env.PORT || '3000');
+const INTERNAL_PORT = 8080; // Sing-box 监听的内部端口
 const UUID = process.env.UUID || crypto.randomUUID();
 const WSPATH = process.env.WSPATH || '/vless-ws';
 const DOMAIN = process.env.DOMAIN || '';
 
-// 1. 生成 Sing-box 配置文件（直接监听容器分配的 PORT）
+// 1. 生成 Sing-box 配置文件（监听内部端口 INTERNAL_PORT）
 const singboxConfig = {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [{
     "type": "vless",
     "tag": "vless-in",
-    "listen": "::",
-    "listen_port": PORT,
+    "listen": "127.0.0.1",
+    "listen_port": INTERNAL_PORT,
     "users": [{ "uuid": UUID, "flow": "" }],
     "transport": {
       "type": "ws",
@@ -29,39 +33,56 @@ const singboxConfig = {
 
 fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(singboxConfig, null, 2));
 
-console.log('==================================================');
-console.log(`[系统初始化] 监听端口: ${PORT}`);
-console.log(`[系统初始化] 节点 UUID: ${UUID}`);
-console.log(`[系统初始化] WebSocket Path: ${WSPATH}`);
-console.log('==================================================');
-
-// 2. 启动 Sing-box 核心
-const sb = spawn('./sing-box', ['run', '-c', 'config.json']);
-
-sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
-sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
-sb.on('exit', (code) => {
-  console.error(`[sing-box] 进程异常退出，退出码: ${code}`);
-  process.exit(1);
+// 2. HTTP 根路由：响应 Deplexo 平台的健康检查
+app.get('/', (req, res) => {
+  res.status(200).send('Deplexo VLESS & Argo Service is Running!');
 });
 
-// 3. 启动 Cloudflare Argo 临时隧道
-const argo = spawn('./cloudflared', ['tunnel', '--url', `http://127.0.0.1:${PORT}`]);
-let argoDomain = '';
+// 3. 将平台的 WebSocket 请求转发给 Sing-box 内部端口
+app.use(
+  WSPATH,
+  createProxyMiddleware({
+    target: `http://127.0.0.1:${INTERNAL_PORT}`,
+    ws: true,
+    changeOrigin: true,
+    logLevel: 'silent'
+  })
+);
 
-const parseArgo = (data) => {
-  const str = data.toString();
-  const match = str.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
-  if (match && match[1] && !argoDomain) {
-    argoDomain = match[1];
-    printLinks(argoDomain);
-  }
-};
+// 4. 启动 Express 监听 PORT
+app.listen(PORT, () => {
+  console.log('==================================================');
+  console.log(`[Express] 服务启动成功，监听端口: ${PORT}`);
+  console.log(`[系统] 节点 UUID: ${UUID}`);
+  console.log(`[系统] WebSocket Path: ${WSPATH}`);
+  console.log('==================================================');
 
-argo.stdout.on('data', parseArgo);
-argo.stderr.on('data', parseArgo);
+  startSubServices();
+});
 
-// 4. 在日志中输出完整的 VLESS 链接
+function startSubServices() {
+  // 启动 Sing-box 核心
+  const sb = spawn('./sing-box', ['run', '-c', 'config.json']);
+  sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
+  sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
+
+  // 启动 Cloudflare Argo 隧道（穿透内部端口 INTERNAL_PORT）
+  const argo = spawn('./cloudflared', ['tunnel', '--url', `http://127.0.0.1:${INTERNAL_PORT}`]);
+  let argoDomain = '';
+
+  const parseArgo = (data) => {
+    const str = data.toString();
+    const match = str.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
+    if (match && match[1] && !argoDomain) {
+      argoDomain = match[1];
+      printLinks(argoDomain);
+    }
+  };
+
+  argo.stdout.on('data', parseArgo);
+  argo.stderr.on('data', parseArgo);
+}
+
 function printLinks(argoDomain) {
   const encodedPath = encodeURIComponent(WSPATH);
   const argoVless = `vless://${UUID}@${argoDomain}:443?type=ws&security=tls&path=${encodedPath}&host=${argoDomain}&sni=${argoDomain}#Deplexo-Argo-VLESS`;
@@ -80,6 +101,5 @@ function printLinks(argoDomain) {
   console.log('==================================================\n');
 }
 
-// 异常捕获，防止程序意外崩溃
 process.on('uncaughtException', (err) => console.error('[Uncaught Exception]', err));
 process.on('unhandledRejection', (reason) => console.error('[Unhandled Rejection]', reason));
