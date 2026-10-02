@@ -31,7 +31,7 @@ app.get('/', (req, res) => {
 app.get(`/${SUB_PATH}`, (req, res) => {
   const host = req.headers.host;
 
-  // 1. 直连节点 (推荐首选)
+  // 1. 直连节点 (首选)
   const vlessDirect = `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=%2Fvless#Abasthan-Direct`;
   
   // 2. Cloudflare 临时隧道 + 优选 IP 节点
@@ -111,13 +111,8 @@ wss.on('connection', (ws) => {
       }
     });
 
-    targetSocket.on('error', () => {
-      ws.close();
-    });
-
-    targetSocket.on('close', () => {
-      ws.close();
-    });
+    targetSocket.on('error', () => ws.close());
+    targetSocket.on('close', () => ws.close());
   });
 
   ws.on('close', () => {
@@ -129,10 +124,33 @@ wss.on('connection', (ws) => {
   });
 });
 
-// 自动下载并启动 Cloudflare Argo 临时隧道
+// 自动下载并启动 Cloudflare Argo 临时隧道（修复 ETXTBSY 问题）
 function startCloudflared(port) {
   const binaryPath = path.join(__dirname, 'cloudflared');
   const downloadUrl = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
+
+  const runCloudflared = () => {
+    try {
+      fs.chmodSync(binaryPath, '755');
+    } catch (e) {
+      console.error('赋予运行权限失败:', e.message);
+    }
+
+    const child = spawn(binaryPath, ['tunnel', '--no-autoupdate', '--url', `http://localhost:${port}`]);
+    
+    child.stderr.on('data', (data) => {
+      const log = data.toString();
+      const match = log.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+      if (match) {
+        argoDomain = match[0].replace('https://', '');
+        console.log(`[Argo Tunnel] Cloudflare 临时隧道启动成功: ${argoDomain}`);
+      }
+    });
+
+    child.on('error', (err) => {
+      console.error('[Argo Tunnel] 进程启动失败:', err.message);
+    });
+  };
 
   const download = (url) => {
     https.get(url, (response) => {
@@ -142,29 +160,15 @@ function startCloudflared(port) {
         const file = fs.createWriteStream(binaryPath);
         response.pipe(file);
         file.on('finish', () => {
-          file.close();
-          try {
-            fs.chmodSync(binaryPath, '755');
-            runCloudflared();
-          } catch (e) {
-            console.error('赋予云端运行权限失败:', e.message);
-          }
+          // 异步等待文件流安全关闭，释放文件占用的句柄
+          file.close(() => {
+            setTimeout(() => {
+              runCloudflared();
+            }, 1000);
+          });
         });
       }
     }).on('error', (err) => console.error('Cloudflared 下载失败:', err.message));
-  };
-
-  const runCloudflared = () => {
-    const child = spawn(binaryPath, ['tunnel', '--no-autoupdate', '--url', `http://localhost:${port}`]);
-    
-    child.stderr.on('data', (data) => {
-      const log = data.toString();
-      const match = log.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-      if (match) {
-        argoDomain = match[0].replace('https://', '');
-        console.log(`[Argo Tunnel] 域名已生效: ${argoDomain}`);
-      }
-    });
   };
 
   if (!fs.existsSync(binaryPath)) {
@@ -174,7 +178,7 @@ function startCloudflared(port) {
   }
 }
 
-// 监听指定端口与 0.0.0.0 IP 地址
+// 启动端口监听
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
   console.log(`[VLESS] 服务已成功启动！`);
