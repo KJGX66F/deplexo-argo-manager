@@ -7,15 +7,22 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const os = require('os');
+
+// 全局捕获未处理异常，防止后台下载或网络报错导致进程 Exit Code 1 崩溃
+process.on('uncaughtException', (err) => {
+  console.error('[全局异常捕获]:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[全局 Promise 异常]:', reason);
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 【核心逻辑】优先读取环境变量 process.env.UUID；未设置则每次启动随机生成 UUID
+// 支持自定义环境变量 UUID，未设置则自动随机生成
 const UUID = process.env.UUID || crypto.randomUUID();
 const cleanUUID = UUID.replace(/-/g, '').toLowerCase();
-
-// 订阅路径优先读取 process.env.SUB_PATH；未设置则与当前 UUID 一致
 const SUB_PATH = process.env.SUB_PATH || UUID;
 
 // 预设高质量社区动态优选域名与企业级 CF 域名
@@ -128,9 +135,9 @@ wss.on('connection', (ws) => {
   ws.on('error', () => { if (targetSocket) targetSocket.destroy(); });
 });
 
-// 使用镜像源加速下载并启动 Argo 隧道
+// 下载并启动 Argo 隧道（放置在 /tmp 目录，保证可写权限）
 function startCloudflared(port) {
-  const binaryPath = path.join(__dirname, 'cloudflared');
+  const binaryPath = path.join(os.tmpdir(), 'cloudflared');
   const downloadUrl = 'https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
 
   const runCloudflared = () => {
@@ -156,33 +163,43 @@ function startCloudflared(port) {
 
   const downloadFile = (url, redirects = 0) => {
     if (redirects > 5) return;
-    https.get(url, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        downloadFile(res.headers.location, redirects + 1);
-      } else if (res.statusCode === 200) {
-        const file = fs.createWriteStream(binaryPath);
-        res.pipe(file);
-        file.on('finish', () => {
-          file.close(() => setTimeout(runCloudflared, 1000));
-        });
-      } else {
-        console.error(`[Argo] 下载失败，HTTP状态码: ${res.statusCode}`);
-      }
-    }).on('error', (err) => console.error('[Argo] 下载错误:', err.message));
+    try {
+      https.get(url, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          downloadFile(res.headers.location, redirects + 1);
+        } else if (res.statusCode === 200) {
+          const file = fs.createWriteStream(binaryPath);
+          file.on('error', (err) => console.error('[Argo] 文件写入错误:', err.message));
+          res.pipe(file);
+          file.on('finish', () => {
+            file.close(() => setTimeout(runCloudflared, 1000));
+          });
+        } else {
+          console.error(`[Argo] 下载失败，HTTP状态码: ${res.statusCode}`);
+        }
+      }).on('error', (err) => console.error('[Argo] 下载网络错误:', err.message));
+    } catch (e) {
+      console.error('[Argo] 下载异常捕获:', e.message);
+    }
   };
 
-  if (!fs.existsSync(binaryPath) || fs.statSync(binaryPath).size < 10000000) {
-    console.log('[Argo] 正在通过镜像加速源下载 cloudflared...');
+  try {
+    if (!fs.existsSync(binaryPath) || fs.statSync(binaryPath).size < 10000000) {
+      console.log('[Argo] 正在下载 cloudflared 到 /tmp 目录...');
+      downloadFile(downloadUrl);
+    } else {
+      runCloudflared();
+    }
+  } catch (e) {
+    console.log('[Argo] 文件检查异常，开始重新下载...');
     downloadFile(downloadUrl);
-  } else {
-    runCloudflared();
   }
 }
 
 // 启动服务
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
-  console.log(`[VLESS] 服务已启动！`);
+  console.log(`[VLESS] 服务已成功启动！监听端口: ${PORT}`);
   console.log(`[VLESS] 当前使用的 UUID: ${UUID}`);
   console.log(`[VLESS] 订阅地址路径: /${SUB_PATH}`);
   console.log(`========================================`);
