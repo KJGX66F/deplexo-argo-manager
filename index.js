@@ -19,24 +19,45 @@ let globalArgoDomain = '';
 let globalArgoVless = '';
 let argoLogBuffer = [];
 
-// 1. 自动为二进制文件赋予 Linux 执行权限 (chmod +x)
-function grantPermissions() {
-  ['sing-box', 'cloudflared'].forEach(file => {
-    const filePath = path.join(__dirname, file);
-    if (fs.existsSync(filePath)) {
-      try {
-        fs.chmodSync(filePath, '755');
-        console.log(`[权限] 已成功设置 ${file} 为可执行`);
-      } catch (e) {
-        try { execSync(`chmod +x ${filePath}`); } catch (err) {}
-      }
-    } else {
-      argoLogBuffer.push(`[错误] 根目录下未找到 ${file} 文件！`);
-      console.error(`[错误] 未找到文件: ${filePath}`);
+// 1. 自动检测并下载缺失的 Linux 二进制文件
+function prepareBinaries() {
+  const sbPath = path.join(__dirname, 'sing-box');
+  const cfPath = path.join(__dirname, 'cloudflared');
+
+  // 检查并自动下载 sing-box
+  if (!fs.existsSync(sbPath)) {
+    const msg = '[系统] 未检测到 sing-box，开始自动下载...';
+    console.log(msg);
+    argoLogBuffer.push(msg);
+    try {
+      execSync(`curl -sL -o sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz && tar -zxvf sing-box.tar.gz --strip-components=1 */sing-box && rm -f sing-box.tar.gz`, { cwd: __dirname });
+      argoLogBuffer.push('[系统] sing-box 下载完成！');
+    } catch (e) {
+      argoLogBuffer.push(`[错误] sing-box 下载失败: ${e.message}`);
     }
-  });
+  }
+
+  // 检查并自动下载 cloudflared
+  if (!fs.existsSync(cfPath)) {
+    const msg = '[系统] 未检测到 cloudflared，开始自动下载...';
+    console.log(msg);
+    argoLogBuffer.push(msg);
+    try {
+      execSync(`curl -sL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64`, { cwd: __dirname });
+      argoLogBuffer.push('[系统] cloudflared 下载完成！');
+    } catch (e) {
+      argoLogBuffer.push(`[错误] cloudflared 下载失败: ${e.message}`);
+    }
+  }
+
+  // 自动设置可执行权限 chmod +x
+  try {
+    execSync(`chmod +x sing-box cloudflared`, { cwd: __dirname });
+    argoLogBuffer.push('[系统] 权限设置完成 (chmod +x)');
+  } catch (e) {
+    argoLogBuffer.push(`[警告] 提权设置提示: ${e.message}`);
+  }
 }
-grantPermissions();
 
 // 2. 生成 Sing-box 配置文件
 const singboxConfig = {
@@ -63,7 +84,7 @@ try {
   console.error('[系统] 写入配置文件失败:', err);
 }
 
-// 3. 网页面板
+// 3. Web 配置面板
 app.get('/', (req, res) => {
   const hostHeader = DOMAIN || req.headers.host || 'olive-echo-1048.de.deplexo.com';
   const directLink = `vless://${UUID}@${hostHeader}:443?type=ws&security=tls&path=${encodeURIComponent(WSPATH)}&host=${hostHeader}&sni=${hostHeader}#Deplexo-Direct-VLESS`;
@@ -86,7 +107,7 @@ app.get('/', (req, res) => {
       .btn:hover { background: #1d4ed8; }
       .status { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; background: #dcfce7; color: #15803d; }
       .status.waiting { background: #fef3c7; color: #b45309; }
-      .log-box { background: #1e1e1e; color: #00ff66; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 11px; max-height: 140px; overflow-y: auto; white-space: pre-wrap; margin-top: 8px; }
+      .log-box { background: #1e1e1e; color: #00ff66; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 11px; max-height: 150px; overflow-y: auto; white-space: pre-wrap; margin-top: 8px; }
     </style>
   </head>
   <body>
@@ -111,10 +132,10 @@ app.get('/', (req, res) => {
       <button class="btn" onclick="copyText('argo-link')">复制 Argo 节点</button>
     `;
   } else {
-    const recentLogs = argoLogBuffer.slice(-8).join('\n') || '等待 Cloudflared 进程响应...';
+    const recentLogs = argoLogBuffer.slice(-10).join('\n') || '准备建立 Argo 隧道...';
     html += `
-      <p><span class="status waiting">⌛ Argo 隧道连接中，请稍后刷新页面...</span></p>
-      <div style="font-size:12px;color:#666;">后台启动日志：</div>
+      <p><span class="status waiting">⌛ 正在初始化/生成隧道，请数秒后刷新...</span></p>
+      <div style="font-size:12px;color:#666;">后台日志输出：</div>
       <div class="log-box">${recentLogs}</div>
       <button class="btn" style="margin-top:10px;background:#4b5563;" onclick="location.reload()">刷新页面</button>
     `;
@@ -135,7 +156,7 @@ app.get('/', (req, res) => {
   res.send(html);
 });
 
-// 4. 订阅地址
+// 4. 订阅接口
 app.get('/sub', (req, res) => {
   const hostHeader = DOMAIN || req.headers.host || 'olive-echo-1048.de.deplexo.com';
   const directLink = `vless://${UUID}@${hostHeader}:443?type=ws&security=tls&path=${encodeURIComponent(WSPATH)}&host=${hostHeader}&sni=${hostHeader}#Deplexo-Direct-VLESS`;
@@ -161,7 +182,11 @@ app.use(
 
 app.listen(PORT, () => {
   console.log(`[Express] 服务启动成功，监听端口: ${PORT}`);
-  startSubServices();
+  // 异步拉取二进制并启动后台核心
+  setTimeout(() => {
+    prepareBinaries();
+    startSubServices();
+  }, 100);
 });
 
 function startSubServices() {
@@ -170,12 +195,12 @@ function startSubServices() {
     const sb = spawn('./sing-box', ['run', '-c', CONFIG_PATH], { cwd: __dirname });
     sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
     sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
-    sb.on('error', (err) => console.error('[sing-box 启动错误]:', err));
+    sb.on('error', (err) => argoLogBuffer.push(`[sing-box 启动错误] ${err.message}`));
   } catch (err) {
-    console.error('[sing-box 执行错误]:', err);
+    argoLogBuffer.push(`[sing-box 启动异常] ${err.message}`);
   }
 
-  // 启动 Cloudflare Argo
+  // 启动 Cloudflare Argo (强制 http2 规避平台 UDP 阻断)
   try {
     const argo = spawn('./cloudflared', [
       'tunnel',
@@ -200,13 +225,9 @@ function startSubServices() {
 
     argo.stdout.on('data', parseArgo);
     argo.stderr.on('data', parseArgo);
-    argo.on('error', (err) => {
-      const msg = `[cloudflared 启动失败] ${err.message} (请检查仓库根目录下是否存在 cloudflared Linux 64位可执行文件)`;
-      console.error(msg);
-      argoLogBuffer.push(msg);
-    });
+    argo.on('error', (err) => argoLogBuffer.push(`[cloudflared 启动失败] ${err.message}`));
   } catch (err) {
-    argoLogBuffer.push(`[cloudflared 执行异常] ${err.message}`);
+    argoLogBuffer.push(`[cloudflared 启动异常] ${err.message}`);
   }
 }
 
