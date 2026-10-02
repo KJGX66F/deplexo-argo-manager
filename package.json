@@ -1,13 +1,11 @@
 {
-  "name": "deplexo-vless",
+  "name": "abasthan-singbox-vless",
   "version": "1.0.0",
-  "description": "Deplexo VLESS Express Server with Argo",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "http-proxy-middleware": "^2.0.6"
+    "nodejs-argo": "^1.0.0"
   }
 }
