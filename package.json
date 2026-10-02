@@ -1,10 +1,10 @@
 {
   "name": "deplexo-vless",
   "version": "1.0.0",
+  "description": "Deplexo VLESS Express Server with Argo",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "node download-bin.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
