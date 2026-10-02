@@ -4,20 +4,22 @@ WORKDIR /app
 
 
 RUN apk add --no-cache \
+bash \
 wget \
 curl \
-bash \
-unzip
+openssl \
+jq \
+tar
 
 
-# 下载 sing-box
+# 安装 sing-box
 RUN wget -O sing-box.tar.gz \
 https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.tar.gz \
-&& tar -xzvf sing-box.tar.gz \
+&& tar -xzf sing-box.tar.gz \
 && mv sing-box-*/sing-box /usr/local/bin/sing-box
 
 
-# cloudflared
+# 安装 cloudflared
 RUN wget -O /usr/local/bin/cloudflared \
 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
 && chmod +x /usr/local/bin/cloudflared
@@ -26,4 +28,7 @@ https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-l
 COPY . .
 
 
-CMD ["bash","start.sh"]
+RUN chmod +x start.sh
+
+
+CMD ["./start.sh"]
