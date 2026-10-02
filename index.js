@@ -15,44 +15,65 @@ const UUID = process.env.UUID || crypto.randomUUID();
 const WSPATH = process.env.WSPATH || '/vless-ws';
 const DOMAIN = process.env.DOMAIN || '';
 
-// 使用可读写的系统临时目录 /tmp，解决 EROFS 只读文件系统报错
-const WORK_DIR = path.join(os.tmpdir(), 'vless-run');
-if (!fs.existsSync(WORK_DIR)) {
-  try {
-    fs.mkdirSync(WORK_DIR, { recursive: true });
-  } catch (e) {}
+let argoLogBuffer = [];
+
+// 1. 自动寻找既可写入又具备执行权限 (Non-noexec) 的工作目录
+function getExecWorkDir() {
+  const candidates = [
+    process.env.HOME ? path.join(process.env.HOME, '.vless-run') : null,
+    '/var/tmp/vless-run',
+    '/dev/shm/vless-run',
+    path.join(os.tmpdir(), 'vless-run')
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const testFile = path.join(dir, `.exec_test_${Date.now()}.sh`);
+      fs.writeFileSync(testFile, '#!/bin/sh\necho 1', { mode: 0o755 });
+      execSync(`"${testFile}"`, { stdio: 'ignore', timeout: 3000 });
+      fs.unlinkSync(testFile);
+      argoLogBuffer.push(`[系统] 找到可执行工作目录: ${dir}`);
+      return dir;
+    } catch (e) {
+      try {
+        const testFile = path.join(dir, `.exec_test_${Date.now()}.sh`);
+        if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+      } catch (err) {}
+    }
+  }
+
+  const fallback = path.join(os.tmpdir(), 'vless-run');
+  if (!fs.existsSync(fallback)) fs.mkdirSync(fallback, { recursive: true });
+  return fallback;
 }
 
+const WORK_DIR = getExecWorkDir();
 const CONFIG_PATH = path.join(WORK_DIR, 'config.json');
 const SB_PATH = path.join(WORK_DIR, 'sing-box');
 const CF_PATH = path.join(WORK_DIR, 'cloudflared');
 
 let globalArgoDomain = '';
 let globalArgoVless = '';
-let argoLogBuffer = [];
 
-// 自动识别 CPU 架构
 function getArch() {
   const arch = process.arch;
   if (arch === 'arm64') return 'arm64';
   return 'amd64';
 }
 
-// 三重下载保障逻辑
+// 强力文件下载逻辑
 async function downloadFile(url, destPath) {
-  // 方式 1: curl
   try {
     execSync(`curl -fsSL -L "${url}" -o "${destPath}"`, { stdio: 'ignore', timeout: 60000 });
     if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) return;
   } catch (e) {}
 
-  // 方式 2: wget
   try {
     execSync(`wget -q -O "${destPath}" "${url}"`, { stdio: 'ignore', timeout: 60000 });
     if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) return;
   } catch (e) {}
 
-  // 方式 3: Node.js https 请求
   return new Promise((resolve, reject) => {
     const fetchUrl = (currentUrl, redirectCount = 0) => {
       if (redirectCount > 10) return reject(new Error('重定向次数过多'));
@@ -87,20 +108,17 @@ async function downloadFile(url, destPath) {
   });
 }
 
-// 赋予执行权限
 function setExecutable(filePath) {
   try { fs.chmodSync(filePath, 0o755); } catch (e) {}
   try { execSync(`chmod +x "${filePath}"`); } catch (e) {}
 }
 
-// 下载与准备程序
 async function prepareBinaries() {
   const arch = getArch();
   argoLogBuffer.push(`[系统] 识别环境架构: Linux ${arch}`);
 
-  // 1. 下载 cloudflared
   if (!fs.existsSync(CF_PATH)) {
-    argoLogBuffer.push('[系统] 正在下载 cloudflared 到 /tmp...');
+    argoLogBuffer.push('[系统] 正在下载 cloudflared...');
     try {
       const cfUrl = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}`;
       await downloadFile(cfUrl, CF_PATH);
@@ -108,7 +126,7 @@ async function prepareBinaries() {
         setExecutable(CF_PATH);
         argoLogBuffer.push('[系统] cloudflared 下载成功并已赋予权限！');
       } else {
-        argoLogBuffer.push('[错误] cloudflared 下载文件无效或为空');
+        argoLogBuffer.push('[错误] cloudflared 下载文件无效');
       }
     } catch (e) {
       argoLogBuffer.push(`[错误] cloudflared 下载失败: ${e.message}`);
@@ -117,9 +135,8 @@ async function prepareBinaries() {
     setExecutable(CF_PATH);
   }
 
-  // 2. 下载 sing-box
   if (!fs.existsSync(SB_PATH)) {
-    argoLogBuffer.push('[系统] 正在下载 sing-box 到 /tmp...');
+    argoLogBuffer.push('[系统] 正在下载 sing-box...');
     const tarPath = path.join(WORK_DIR, 'sing-box.tar.gz');
     try {
       const sbUrl = `https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-${arch}.tar.gz`;
@@ -132,7 +149,6 @@ async function prepareBinaries() {
       }
       if (fs.existsSync(tarPath)) fs.unlinkSync(tarPath);
 
-      // 如果解压到了子目录，自动寻找并移动到 WORK_DIR
       if (!fs.existsSync(SB_PATH)) {
         const files = fs.readdirSync(WORK_DIR);
         for (const file of files) {
@@ -186,7 +202,54 @@ try {
   console.error('[系统] 写入配置文件失败:', err);
 }
 
-// Web 配置面板页面
+// 2. 核心启动器：遇到 noexec 磁盘限制时自动切入内存 (memfd) 运行
+function runBinaryProcess(binPath, args, onData, onError) {
+  let child = spawn(binPath, args);
+
+  child.on('error', (err) => {
+    if (err.code === 'EACCES') {
+      const name = path.basename(binPath);
+      argoLogBuffer.push(`[提示] ${name} 受到磁盘 noexec 限制，尝试内存 RAM 解封启动...`);
+      runInMemfd(binPath, args, onData, onError);
+    } else if (onError) {
+      onError(err);
+    }
+  });
+
+  if (child.stdout) child.stdout.on('data', onData);
+  if (child.stderr) child.stderr.on('data', onData);
+  return child;
+}
+
+function runInMemfd(binPath, args, onData, onError) {
+  const pyScript = `
+import os, sys, subprocess
+bin_path = sys.argv[1]
+cmd_args = sys.argv[2:]
+with open(bin_path, 'rb') as f:
+    data = f.read()
+fd = os.memfd_create('runner', 0)
+os.write(fd, data)
+os.fchmod(fd, 0o755)
+exe = f'/proc/self/fd/{fd}'
+os.execv(exe, [exe] + cmd_args)
+`;
+  let pyProc = spawn('python3', ['-c', pyScript, binPath, ...args]);
+  
+  pyProc.on('error', () => {
+    pyProc = spawn('python', ['-c', pyScript, binPath, ...args]);
+    pyProc.on('error', (err) => {
+      if (onError) onError(err);
+    });
+    if (pyProc.stdout) pyProc.stdout.on('data', onData);
+    if (pyProc.stderr) pyProc.stderr.on('data', onData);
+  });
+
+  if (pyProc.stdout) pyProc.stdout.on('data', onData);
+  if (pyProc.stderr) pyProc.stderr.on('data', onData);
+}
+
+// Web 配置界面
 app.get('/', (req, res) => {
   const hostHeader = DOMAIN || req.headers.host || 'olive-echo-1048.de.deplexo.com';
   const directLink = `vless://${UUID}@${hostHeader}:443?type=ws&security=tls&path=${encodeURIComponent(WSPATH)}&host=${hostHeader}&sni=${hostHeader}#Deplexo-Direct-VLESS`;
@@ -271,7 +334,7 @@ app.get('/sub', (req, res) => {
   res.send(base64Sub);
 });
 
-// WebSocket 流量转发
+// WebSocket 代理
 app.use(
   WSPATH,
   createProxyMiddleware({
@@ -293,52 +356,42 @@ app.listen(PORT, async () => {
 });
 
 function startSubServices() {
-  // 启动 Sing-box
+  // 1. 启动 Sing-box
   if (!fs.existsSync(SB_PATH)) {
     argoLogBuffer.push(`[错误] 无法启动 sing-box: 文件不存在`);
   } else {
-    try {
-      const sb = spawn(SB_PATH, ['run', '-c', CONFIG_PATH]);
-      sb.stdout.on('data', (d) => console.log(`[sing-box] ${d.toString().trim()}`));
-      sb.stderr.on('data', (d) => console.error(`[sing-box] ${d.toString().trim()}`));
-      sb.on('error', (err) => argoLogBuffer.push(`[sing-box 启动错误] ${err.message}`));
-    } catch (err) {
-      argoLogBuffer.push(`[sing-box 启动异常] ${err.message}`);
-    }
+    runBinaryProcess(
+      SB_PATH,
+      ['run', '-c', CONFIG_PATH],
+      (d) => console.log(`[sing-box] ${d.toString().trim()}`),
+      (err) => argoLogBuffer.push(`[sing-box 启动失败] ${err.message}`)
+    );
   }
 
-  // 启动 Cloudflare Argo
+  // 2. 启动 Cloudflare Argo
   if (!fs.existsSync(CF_PATH)) {
     argoLogBuffer.push(`[错误] 无法启动 cloudflared: 文件不存在`);
   } else {
-    try {
-      const argo = spawn(CF_PATH, [
-        'tunnel',
-        '--no-autoupdate',
-        '--protocol', 'http2',
-        '--url', `http://127.0.0.1:${INTERNAL_PORT}`
-      ]);
+    const parseArgo = (data) => {
+      const str = data.toString().trim();
+      argoLogBuffer.push(str);
+      if (argoLogBuffer.length > 30) argoLogBuffer.shift();
 
-      const parseArgo = (data) => {
-        const str = data.toString().trim();
-        argoLogBuffer.push(str);
-        if (argoLogBuffer.length > 30) argoLogBuffer.shift();
+      const match = str.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
+      if (match && match[1] && !globalArgoDomain) {
+        globalArgoDomain = match[1];
+        const encodedPath = encodeURIComponent(WSPATH);
+        globalArgoVless = `vless://${UUID}@${globalArgoDomain}:443?type=ws&security=tls&path=${encodedPath}&host=${globalArgoDomain}&sni=${globalArgoDomain}#Deplexo-Argo-VLESS`;
+        console.log(`[Argo] 隧道生成成功: ${globalArgoDomain}`);
+      }
+    };
 
-        const match = str.match(/https:\/\/([a-zA-Z0-9-]+\.trycloudflare\.com)/);
-        if (match && match[1] && !globalArgoDomain) {
-          globalArgoDomain = match[1];
-          const encodedPath = encodeURIComponent(WSPATH);
-          globalArgoVless = `vless://${UUID}@${globalArgoDomain}:443?type=ws&security=tls&path=${encodedPath}&host=${globalArgoDomain}&sni=${globalArgoDomain}#Deplexo-Argo-VLESS`;
-          console.log(`[Argo] 隧道生成成功: ${globalArgoDomain}`);
-        }
-      };
-
-      argo.stdout.on('data', parseArgo);
-      argo.stderr.on('data', parseArgo);
-      argo.on('error', (err) => argoLogBuffer.push(`[cloudflared 启动失败] ${err.message}`));
-    } catch (err) {
-      argoLogBuffer.push(`[cloudflared 启动异常] ${err.message}`);
-    }
+    runBinaryProcess(
+      CF_PATH,
+      ['tunnel', '--no-autoupdate', '--protocol', 'http2', '--url', `http://127.0.0.1:${INTERNAL_PORT}`],
+      parseArgo,
+      (err) => argoLogBuffer.push(`[cloudflared 启动失败] ${err.message}`)
+    );
   }
 }
 
