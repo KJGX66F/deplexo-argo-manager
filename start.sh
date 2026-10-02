@@ -1,53 +1,16 @@
-#!/bin/bash
+#!/bin/sh
 
-
-echo "================================"
-echo "Sing-box Argo VLESS启动"
-echo "================================"
-
-
-
-# 自动生成UUID
 
 UUID=$(cat /proc/sys/kernel/random/uuid)
 
 
-
-echo ""
-echo "生成UUID:"
-echo $UUID
-echo ""
+sed "s/UUID/$UUID/" config.json > sb.json
 
 
-
-# 生成配置
-
-sed \
-"s/UUID_PLACEHOLDER/$UUID/g" \
-config.template.json \
-> config.json
+sing-box run -c sb.json &
 
 
-
-echo "sing-box配置完成"
-
-
-
-# 启动sing-box
-
-sing-box run \
--c config.json &
-
-
-
-sleep 3
-
-
-
-echo ""
-echo "启动Cloudflare Tunnel"
-echo ""
-
+sleep 2
 
 
 cloudflared tunnel \
