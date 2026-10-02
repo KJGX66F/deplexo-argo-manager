@@ -1,7 +1,7 @@
 {
-  "name": "deplexo-singbox-vless",
+  "name": "deplexo-singbox-vless-argo",
   "version": "1.0.0",
-  "description": "Sing-box VLESS on Deplexo",
+  "description": "Singbox VLESS + Argo Tunnel on Deplexo",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
